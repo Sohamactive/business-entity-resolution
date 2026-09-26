@@ -203,17 +203,23 @@ Records with the same key go in the same "block" — hence the name.
 - Country grouping is done dynamically (e.g. `group_by("country")` in polars) on whatever value is actually present in the data.
 - No `if country == "US"` / `elif country == "India"` branching logic anywhere in the pipeline. Any country-aware logic must be config/lookup-driven with a generic fallback for unseen country values — minimize this regardless, consistent with staying script-blind in normalization (§6).
 
-### Blocking keys
-1. **Country** — cheap, safe, near-zero recall risk. Never compare across countries.
-2. **Name-key** — sorted-token key: normalized name → split into words → sort alphabetically → join → take first N characters. Handles word-order transpositions (e.g. "Orelee's Barbershop" vs "Barbershop Orelee's") while staying a cheap, groupable string.
-3. **Address-key** — a coarse key extracted from the normalized address (e.g. city/state token), as a secondary/backup signal for cases where the name-key misses (DBA/trade names differing from legal name, etc.).
+### Blocking keys (Finalized)
+1. **Country** — cheap, safe, zero recall risk (0 cross-country matches in ground truth). Dynamically partitioned.
+2. **Name-keys (Pass A — Stopword & Legal Suffix Filtered)**:
+   - `NF_{prefix}`: First 4 characters of the leading distinctive word (preserves primary brand identity).
+   - `NS_{prefix}`: First 4 characters of the sorted distinctive words (order-invariant).
+   - *Design rationale*: Filtering stopwords and normalized legal suffixes (`incorporated`, `limited`, `company`) is mandatory. Otherwise, `Prime Money Inc.` (`inco`) and `Prime Money` (`mone`) land in different blocks, and blocks for `inco` / `comp` explode to >180,000 entities (>72 billion pairs).
+3. **Compound Address-keys (Pass B)**:
+   - `ANW_{num}_{street_prefix}`: Normalized integer building/plot number (stripped of leading zeros) + first distinctive street word prefix (length 4). E.g., `17560_elli`, `1795_west`, `85_wayn`.
+   - `ANW_{num}_{locality_prefix}`: Number + last distinctive locality/city token, ensuring invariance to component reordering (City first vs. Street first).
+   - `AWP_{word1}_{word2}`: Fallback for addresses without digits (~5.7% of records), combining the first two distinctive locality tokens (e.g. `west_beng`).
+   - *Design rationale*: Coarse geography alone (state/city) produces blocks of 161,431 entities in Maharashtra alone (64 billion pairs), causing immediate OOM. Coupling number + street token drops max block size in 100k records to 48 while successfully catching cross-script Indian records (where names are in Tamil/Devanagari but addresses are in Latin script).
 
-### Strategy: two passes, unioned
-- **Pass A:** country + name-key
-- **Pass B:** country + address-key
+### Strategy: multi-pass, unioned with configurable candidate cap
 - Final candidate set per Source 1 entity = **union** of both passes.
-
-**Why union over a single combined key:** name and address noise fail independently, not together — a record with a mismatched name but intact address (or vice versa) still survives via the other pass. A single combined key would drop the record if *either* dimension failed to match. Since blocking recall misses are unrecoverable downstream (unlike precision, which the model/threshold stage in §8–9 handles), the union approach trades a larger candidate set for a safer recall ceiling — an acceptable cost given F_0.5's downstream precision control.
+- **Candidate capping**: Configurable via `.env` (`BLOCKING_MAX_CANDIDATES`, default: 150). Candidates matching on multiple keys or higher-specificity address keys are prioritized.
+- **Holdout Validation Recall**: 93.53% overall (US: 97.62%, India: 87.36%) with median candidate pool of 67.
+- **Output formatting**: Exported to `output/candidate_pairs.tsv` with `quote_style="never"` and `null_value=""`, ensuring singletons produce true empty fields and passing all checks in `validate_submission.py`.
 
 ### Output
 This stage's candidate set (before final model narrowing) is saved as `candidate_pairs.tsv` — the exact input fed to the matching model in §8/§9.

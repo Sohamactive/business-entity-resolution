@@ -1,4 +1,7 @@
 data/
 .venv/
 .env
+*.ipynb
 
+__pycache__/*
+*.pyc
