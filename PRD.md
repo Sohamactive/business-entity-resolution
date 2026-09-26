@@ -225,8 +225,8 @@ This stage's candidate set (before final model narrowing) is saved as `candidate
 
 ## 8. Feature Engineering & Matching Model
 
-
-### 8.1 String similarity method — options considered (needs to be decided for now)
+### 8.1 String similarity method — options considered
+*(Decision finalized in §8.2 — table kept for reference/methodology doc.)*
 
 | Method | What it does | Setup time | Speed at scale | Word-order robust | Script-agnostic |
 |---|---|---|---|---|---|
@@ -235,7 +235,7 @@ This stage's candidate set (before final model narrowing) is saved as `candidate
 | **TF-IDF (character n-gram) + cosine similarity** | Weights n-grams by distinctiveness (common chunks down-weighted, rare/distinctive chunks up-weighted), compares as vectors via cosine angle | Medium — needs `TfidfVectorizer(analyzer='char')` + fit/transform | Fast — vectorizable | Yes | Yes (when using `analyzer='char'`, not word-based) |
 
 ### 8.2 Decision
-- **Iteration 1:** Trigram Jaccard similarity — cheap, fast, script-agnostic, good enough to validate the end-to-end pipeline without burning setup time.
+- **Iteration 1 (in progress):** Trigram Jaccard similarity — cheap, fast, script-agnostic, good enough to validate the end-to-end pipeline without burning setup time.
 - **Iteration 2/3 (time permitting):** Upgrade to TF-IDF character n-gram + cosine similarity — smarter weighting (down-weights generic terms like "Inc"/"Ltd" that inflate similarity without being distinctive), same script-agnostic/word-order-robust properties as trigram Jaccard, for a precision boost.
 - `difflib.SequenceMatcher` rejected outright — not vectorizable at this row count (millions of candidate pairs), and word-order sensitivity is a real problem given the transposition noise pattern called out in the problem statement.
 
@@ -244,6 +244,7 @@ This stage's candidate set (before final model narrowing) is saved as `candidate
 - **Address similarity** — same method on `normalized_address`. Weaker alone (addresses noisier/more incomplete), strong combined with name.
 - **Country match** — binary (1 if same country, 0 otherwise). Should be ~always 1 post-blocking; acts as a sanity check.
 - **Length-based sanity features** (optional, cheap) — absolute difference / ratio in name length, to catch misleadingly high similarity on very short strings.
+- **Output of this stage:** candidate pairs with similarity columns attached (an intermediate, in-memory table — *not* `matching_results.tsv` yet). Feeds directly into §8.4.
 
 ### 8.4 Iteration 1 — threshold rule
 ```
@@ -253,6 +254,8 @@ match if combined_score > threshold
 Threshold tuned on the internal validation split (§9) against `train_ground_truth.tsv`, optimizing for **F_0.5** specifically — not accuracy.
 
 Note: an S1 entity can have multiple true matches — this is not "pick the single best candidate," it's "keep every candidate above threshold" for that entity.
+
+**Output boundary (clarified):** this step, followed by grouping accepted pairs by `source1_entity_id`, is what actually produces `matching_results.tsv`. Feature engineering (§8.3) alone does not — it only computes the similarity scores this step consumes. Treat threshold/grouping as a separate function from similarity computation, so the threshold can be tuned without recomputing similarity every time.
 
 ### 8.5 Iteration 3+ — real classifier
 Once blocking and features are trusted (via §9 validation), swap the threshold rule for **gradient boosting (LightGBM/XGBoost)** trained on the same features (name sim, address sim, country match, length features), with `train_ground_truth.tsv` providing binary match/no-match labels. Fast to train, interpretable (good for methodology doc), tiny parameter count (trivially satisfies the ≤8B/MIT-Apache constraint), strong performance on tabular similarity-feature problems.
