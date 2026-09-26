@@ -152,25 +152,25 @@ if __name__ == "__main__":
 
     for value in address_examples:
         print(f"{value!r} -> {normalize_address(value)!r}\n\n")
-    # data = Path("../../../data/student_resource/dataset")
-    # source3_path = data / "train" / "train_source3.tsv"
+    data = Path("../../../data/student_resource/dataset")
+    source3_path = data / "train" / "train_source3.tsv"
 
-    # df = pl.read_csv(
-    #     source3_path,
-    #     separator="\t",
-    #     infer_schema=False,
-    #     n_rows=10
-    # )
-    # normalized_df = normalize_dataframe(df)
-    # print(
-    #     normalized_df.select(
-    #         [
-    #             "entity_id",
-    #             "business_name",
-    #             "normalized_name",
-    #             "business_address",
-    #             "normalized_address",
-    #             "country",
-    #         ]
-    #     )
-    # )
+    df = pl.read_csv(
+        source3_path,
+        separator="\t",
+        infer_schema=False,
+        n_rows=10
+    )
+    normalized_df = normalize_dataframe(df)
+    print(
+        normalized_df.select(
+            [
+                "entity_id",
+                "business_name",
+                "normalized_name",
+                "business_address",
+                "normalized_address",
+                "country",
+            ]
+        )
+    )
