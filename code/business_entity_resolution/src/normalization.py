@@ -25,6 +25,7 @@ LEGAL_SUFFIXES = {
     "sarl": "societe a responsabilite limitee",
     "sas": "societe par actions simplifiee",
     "sasu": "societe par actions simplifiee unipersonnelle",
+    "pty": "proprietary",
 }
 
 

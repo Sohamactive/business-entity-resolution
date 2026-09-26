@@ -47,7 +47,7 @@ NAME_STOPWORDS = {
     "company", "limited", "private", "corporation", "incorporated",
     "liability", "societe", "simplifiee", "unipersonnelle", "responsabilite",
     "co", "ltd", "pvt", "corp", "inc", "llc", "plc", "llp", "sarl", "sas", "sasu",
-    "eurl", "gmbh", "sa", "ag",
+    "eurl", "gmbh", "sa", "ag", "pty", "proprietary",
     # Generic Business Descriptors (produce bloated, uninformative blocks)
     "services", "service", "group", "enterprises", "enterprise",
     "center", "centre", "solutions", "solution", "holdings", "holding",
