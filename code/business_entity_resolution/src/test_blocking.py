@@ -14,6 +14,7 @@ from business_entity_resolution.src.blocking import (
     extract_name_keys,
     iter_candidate_pair_batches,
     save_candidate_pairs,
+    write_candidate_outputs,
 )
 from business_entity_resolution.src.normalization import normalize_address, normalize_name
 
@@ -214,7 +215,46 @@ class TestBlocking(unittest.TestCase):
         concatenated = pl.concat(batches)
         self.assertEqual(len(concatenated), 3)
 
+    def test_write_candidate_outputs_keeps_tsv_and_parquet_consistent(self):
+        s1 = pl.DataFrame({
+            "entity_id": ["S1-001", "S1-002"],
+            "country": ["US", "US"],
+            "normalized_name": ["alpha cafe", "beta store"],
+            "normalized_address": ["10 main street", ""],
+        })
+        pool = pl.DataFrame({
+            "entity_id": ["S2-101", "S3-202"],
+            "country": ["US", "US"],
+            "normalized_name": ["alpha cafe", "alpha coffee"],
+            "normalized_address": ["10 main st", "12 oak road"],
+        })
+        candidate_df = pl.DataFrame({
+            "source1_entity_id": ["S1-001", "S1-002"],
+            "candidate_entity_ids": ["S2-101,S3-202", ""],
+        })
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            tsv_path, cache_dir, pair_count = write_candidate_outputs(
+                candidate_df=candidate_df,
+                s1_df=s1,
+                pool_df=pool,
+                candidate_tsv_path=tmp / "candidate_pairs.tsv",
+                pair_cache_dir=tmp / "pairs",
+                batch_size=1,
+                force=True,
+            )
+
+            self.assertEqual(pair_count, 2)
+            self.assertEqual(len(list(cache_dir.glob("part-*.parquet"))), 1)
+            pairs = pl.scan_parquet(cache_dir / "part-*.parquet").collect()
+            self.assertEqual(
+                set(pairs["candidate_id"].to_list()), {"S2-101", "S3-202"}
+            )
+            lines = tsv_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 3)
+            self.assertEqual(lines[2], "S1-002\t")
+
 
 if __name__ == "__main__":
     unittest.main()
-

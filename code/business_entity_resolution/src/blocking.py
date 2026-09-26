@@ -429,6 +429,34 @@ def build_candidate_pairs_table(
     )
 
 
+def build_candidate_id_pairs(candidate_df: pl.DataFrame) -> pl.DataFrame:
+    """Explode compact candidates without joining the full source pool.
+
+    Blocking only needs to persist the pair IDs. Feature engineering can join
+    these IDs to normalized source data in its own bounded batches. Avoiding a
+    full Source 2/3 metadata join here is critical at multi-million-row scale.
+    """
+    non_empty = candidate_df.filter(
+        pl.col("candidate_entity_ids").fill_null("").str.len_bytes() > 0
+    )
+    if len(non_empty) == 0:
+        return pl.DataFrame(
+            schema={
+                "source1_entity_id": pl.String,
+                "candidate_id": pl.String,
+            }
+        )
+
+    return (
+        non_empty
+        .with_columns(pl.col("candidate_entity_ids").str.split(","))
+        .explode("candidate_entity_ids", empty_as_null=True)
+        .filter(pl.col("candidate_entity_ids").str.len_bytes() > 0)
+        .rename({"candidate_entity_ids": "candidate_id"})
+        .select("source1_entity_id", "candidate_id")
+    )
+
+
 def iter_candidate_pair_batches(
     candidate_df: pl.DataFrame,
     s1_df: pl.DataFrame,
@@ -451,30 +479,172 @@ def iter_candidate_pair_batches(
     Yields:
         Polars DataFrames of up to `batch_size` candidate pairs each.
     """
-    non_empty = (
-        candidate_df
-        .filter(pl.col("candidate_entity_ids").is_not_null())
-        .filter(pl.col("candidate_entity_ids").str.len_bytes() > 0)
-    )
+    # Accumulate only enough compact rows to form one pair batch. Never
+    # explode the complete candidate table before yielding.
+    pending_rows: list[tuple[str, str]] = []
+    pending_pairs = 0
 
-    if len(non_empty) == 0:
-        return
+    def flush_pending() -> pl.DataFrame | None:
+        nonlocal pending_rows, pending_pairs
+        if not pending_rows:
+            return None
 
-    exploded = (
-        non_empty
-        .with_columns(pl.col("candidate_entity_ids").str.split(","))
-        .explode("candidate_entity_ids", empty_as_null=True)
-        .filter(pl.col("candidate_entity_ids").str.len_bytes() > 0)
-        .rename({"candidate_entity_ids": "candidate_id"})
-    )
-
-    total_pairs = len(exploded)
-    for offset in range(0, total_pairs, batch_size):
-        chunk_exploded = exploded.slice(offset, batch_size)
-        yield _join_pairs_with_metadata(
-            exploded_pairs=chunk_exploded,
+        pending = pl.DataFrame(
+            {
+                "source1_entity_id": [row[0] for row in pending_rows],
+                "candidate_entity_ids": [row[1] for row in pending_rows],
+            }
+        )
+        exploded = (
+            pending
+            .with_columns(pl.col("candidate_entity_ids").str.split(","))
+            .explode("candidate_entity_ids", empty_as_null=True)
+            .filter(pl.col("candidate_entity_ids").str.len_bytes() > 0)
+            .rename({"candidate_entity_ids": "candidate_id"})
+        )
+        result = _join_pairs_with_metadata(
+            exploded_pairs=exploded,
             s1_df=s1_df,
             pool_df=pool_df,
             include_normalized=include_normalized,
         )
+        pending_rows = []
+        pending_pairs = 0
+        return result
 
+    for source1_id, candidate_ids in candidate_df.iter_rows():
+        ids = [candidate_id for candidate_id in (candidate_ids or "").split(",") if candidate_id]
+        if not ids:
+            continue
+
+        for start in range(0, len(ids), batch_size):
+            id_chunk = ids[start : start + batch_size]
+            if pending_rows and pending_pairs + len(id_chunk) > batch_size:
+                result = flush_pending()
+                if result is not None:
+                    yield result
+
+            pending_rows.append((source1_id, ",".join(id_chunk)))
+            pending_pairs += len(id_chunk)
+
+    result = flush_pending()
+    if result is not None:
+        yield result
+
+
+def write_candidate_outputs(
+    candidate_df: pl.DataFrame,
+    s1_df: pl.DataFrame,
+    pool_df: pl.DataFrame,
+    candidate_tsv_path: str | Path = "output/candidate_pairs.tsv",
+    pair_cache_dir: str | Path = "cache/candidates/test_pairs",
+    batch_size: int = 50_000,
+    force: bool = False,
+) -> tuple[Path, Path, int]:
+    """Write compact candidates and long-form candidate parts together.
+
+    The compact TSV is the required submission artifact. The Parquet parts are
+    an internal cache consumed by feature engineering. Both are produced from
+    the same bounded candidate chunks so feature experiments do not rerun
+    blocking.
+    """
+    candidate_tsv_path = Path(candidate_tsv_path)
+    pair_cache_dir = Path(pair_cache_dir)
+    candidate_tsv_path.parent.mkdir(parents=True, exist_ok=True)
+    pair_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if candidate_tsv_path.exists() and not force:
+        raise FileExistsError(
+            f"Candidate TSV already exists: {candidate_tsv_path}. "
+            "Pass force=True to replace it."
+        )
+
+    existing_parts = sorted(pair_cache_dir.glob("part-*.parquet"))
+    if existing_parts and not force:
+        raise FileExistsError(
+            f"Candidate cache already contains Parquet parts: {pair_cache_dir}. "
+            "Pass force=True to replace them."
+        )
+    if force:
+        for part in existing_parts:
+            part.unlink()
+
+    return write_candidate_outputs_from_batches(
+        candidate_batches=[candidate_df],
+        s1_df=s1_df,
+        pool_df=pool_df,
+        candidate_tsv_path=candidate_tsv_path,
+        pair_cache_dir=pair_cache_dir,
+        force=force,
+        batch_size=batch_size,
+    )
+
+
+def iter_blocking_candidate_batches(
+    s1_df: pl.DataFrame,
+    index: BlockingIndex,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    batch_size: int = 50_000,
+) -> Iterator[pl.DataFrame]:
+    """Yield compact candidate batches without materializing all S1 results."""
+    for offset in range(0, len(s1_df), batch_size):
+        yield block_source1_against_index(
+            s1_df.slice(offset, batch_size),
+            index=index,
+            max_candidates=max_candidates,
+        )
+
+
+def write_candidate_outputs_from_batches(
+    candidate_batches: Iterable[pl.DataFrame],
+    s1_df: pl.DataFrame,
+    pool_df: pl.DataFrame,
+    candidate_tsv_path: str | Path = "output/candidate_pairs.tsv",
+    pair_cache_dir: str | Path = "cache/candidates/test_pairs",
+    batch_size: int = 50_000,
+    force: bool = False,
+) -> tuple[Path, Path, int]:
+    """Write compact TSV and Parquet parts as candidate batches arrive."""
+    candidate_tsv_path = Path(candidate_tsv_path)
+    pair_cache_dir = Path(pair_cache_dir)
+    candidate_tsv_path.parent.mkdir(parents=True, exist_ok=True)
+    pair_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if candidate_tsv_path.exists() and not force:
+        raise FileExistsError(
+            f"Candidate TSV already exists: {candidate_tsv_path}. "
+            "Pass force=True to replace it."
+        )
+
+    existing_parts = sorted(pair_cache_dir.glob("part-*.parquet"))
+    if existing_parts and not force:
+        raise FileExistsError(
+            f"Candidate cache already contains Parquet parts: {pair_cache_dir}. "
+            "Pass force=True to replace them."
+        )
+    if force:
+        for part in existing_parts:
+            part.unlink()
+
+    pair_count = 0
+    part_count = 0
+    with candidate_tsv_path.open("w", encoding="utf-8", newline="\n") as output:
+        output.write("source1_entity_id\tcandidate_entity_ids\n")
+
+        for batch_number, candidate_chunk in enumerate(candidate_batches, start=1):
+            for source1_id, candidate_ids in candidate_chunk.iter_rows():
+                output.write(f"{source1_id}\t{candidate_ids or ''}\n")
+            pair_chunk = build_candidate_id_pairs(candidate_chunk)
+            if len(pair_chunk) == 0:
+                continue
+
+            part_path = pair_cache_dir / f"part-{part_count:05d}.parquet"
+            pair_chunk.write_parquet(part_path)
+            pair_count += len(pair_chunk)
+            part_count += 1
+            print(
+                f"   Wrote batch {batch_number}: {len(candidate_chunk)} S1 rows, "
+                f"{len(pair_chunk)} candidate pairs"
+            )
+
+    return candidate_tsv_path, pair_cache_dir, pair_count

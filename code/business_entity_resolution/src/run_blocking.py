@@ -22,23 +22,27 @@ from dotenv import load_dotenv
 from business_entity_resolution.src.blocking import (
     DEFAULT_MAX_CANDIDATES,
     BlockingIndex,
-    block_source1_against_index,
-    save_candidate_pairs,
+    iter_blocking_candidate_batches,
+    write_candidate_outputs_from_batches,
 )
-from business_entity_resolution.src.normalization import normalize_dataframe
 
 load_dotenv()
 
 
 def run_blocking_pipeline(
-    source1_path: Path,
-    source2_path: Path,
-    source3_path: Path,
+    normalized_dir: Path,
     output_path: Path,
+    candidate_cache_dir: Path,
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    batch_size: int = 50_000,
     limit: int | None = None,
+    force: bool = False,
 ) -> Path:
-    """Execute end-to-end blocking: load -> normalize -> index -> block -> save."""
+    """Execute blocking from normalized Parquet caches."""
+    source1_path = normalized_dir / "test_source1.parquet"
+    source2_path = normalized_dir / "test_source2.parquet"
+    source3_path = normalized_dir / "test_source3.parquet"
+
     print("=" * 70)
     print("RUNNING BUSINESS ENTITY RESOLUTION BLOCKING PIPELINE")
     print(f"  Source 1:       {source1_path}")
@@ -52,55 +56,60 @@ def run_blocking_pipeline(
 
     total_start = time.time()
 
-    # 1. Load data
-    print("1. Loading datasets with Polars...")
+    # 1. Load normalized Parquet caches
+    print("1. Loading normalized Parquet caches...")
     t0 = time.time()
-    s1_scan = pl.scan_csv(source1_path, separator="\t")
-    s2_scan = pl.scan_csv(source2_path, separator="\t")
-    s3_scan = pl.scan_csv(source3_path, separator="\t")
+    required_columns = [
+        "entity_id",
+        "country",
+        "normalized_name",
+        "normalized_address",
+    ]
+    s1_scan = pl.scan_parquet(source1_path).select(required_columns)
+    s2_scan = pl.scan_parquet(source2_path).select(required_columns)
+    s3_scan = pl.scan_parquet(source3_path).select(required_columns)
 
     if limit:
-        s1_df = s1_scan.head(limit).collect()
-        s2_df = s2_scan.head(limit * 2).collect()
-        s3_df = s3_scan.head(limit * 2).collect()
+        s1_df = s1_scan.head(limit).collect(engine="streaming")
+        s2_df = s2_scan.head(limit * 2).collect(engine="streaming")
+        s3_df = s3_scan.head(limit * 2).collect(engine="streaming")
     else:
-        s1_df = s1_scan.collect()
-        s2_df = s2_scan.collect()
-        s3_df = s3_scan.collect()
+        s1_df = s1_scan.collect(engine="streaming")
+        s2_df = s2_scan.collect(engine="streaming")
+        s3_df = s3_scan.collect(engine="streaming")
 
     print(f"   Loaded {len(s1_df)} S1, {len(s2_df)} S2, {len(s3_df)} S3 in {time.time() - t0:.2f}s")
 
-    # 2. Normalize
-    print("2. Normalizing textual fields (script-blind NFKC + legal expansion)...")
-    t0 = time.time()
-    s1_norm = normalize_dataframe(s1_df)
-    s2_norm = normalize_dataframe(s2_df)
-    s3_norm = normalize_dataframe(s3_df)
-    print(f"   Normalized {len(s1_norm) + len(s2_norm) + len(s3_norm)} records in {time.time() - t0:.2f}s")
-
-    # 3. Build inverted index on S2 + S3 pool
-    print("3. Building inverted index on Source 2 and Source 3 pool...")
+    # 2. Build inverted index on S2 + S3 pool
+    print("2. Building inverted index on Source 2 and Source 3 pool...")
     t0 = time.time()
     index = BlockingIndex()
-    index.add_dataframe(s2_norm)
-    index.add_dataframe(s3_norm)
+    index.add_dataframe(s2_df)
+    index.add_dataframe(s3_df)
     print(f"   Indexed pool in {time.time() - t0:.2f}s")
 
-    # 4. Generate candidates for Source 1
-    print("4. Querying blocking keys and generating candidate pairs...")
+    # 3. Generate and persist candidate batches for Source 1
+    print("3. Querying blocking keys and generating candidate pairs...")
     t0 = time.time()
-    cand_df = block_source1_against_index(
-        s1_norm,
+    candidate_batches = iter_blocking_candidate_batches(
+        s1_df=s1_df,
         index=index,
         max_candidates=max_candidates,
+        batch_size=batch_size,
     )
-    print(f"   Blocking completed in {time.time() - t0:.2f}s ({len(s1_norm) / (time.time() - t0):.0f} S1/sec)")
-
-    # 5. Save candidate_pairs.tsv
-    print("5. Saving output TSV...")
-    t0 = time.time()
-    out = save_candidate_pairs(cand_df, output_path)
-    print(f"   Saved {len(cand_df)} rows to {out} in {time.time() - t0:.2f}s")
+    out, cache_dir, pair_count = write_candidate_outputs_from_batches(
+        candidate_batches=candidate_batches,
+        s1_df=s1_df,
+        pool_df=pl.concat([s2_df, s3_df]),
+        candidate_tsv_path=output_path,
+        pair_cache_dir=candidate_cache_dir,
+        batch_size=batch_size,
+        force=force,
+    )
+    blocking_seconds = time.time() - t0
+    print(f"   Blocking and output completed in {blocking_seconds:.2f}s ({len(s1_df) / blocking_seconds:.0f} S1/sec)")
+    print(f"   Saved {len(s1_df)} TSV rows to {out}")
+    print(f"   Saved {pair_count} long-form pairs to {cache_dir}")
 
     print("-" * 70)
     print(f"PIPELINE COMPLETE in {time.time() - total_start:.2f}s")
@@ -111,22 +120,10 @@ def run_blocking_pipeline(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run blocking candidate generation pipeline.")
     parser.add_argument(
-        "--source1",
+        "--normalized-dir",
         type=Path,
-        default=Path("data/student_resource/dataset/test/test_source1.tsv"),
-        help="Path to Source 1 TSV",
-    )
-    parser.add_argument(
-        "--source2",
-        type=Path,
-        default=Path("data/student_resource/dataset/test/test_source2.tsv"),
-        help="Path to Source 2 TSV",
-    )
-    parser.add_argument(
-        "--source3",
-        type=Path,
-        default=Path("data/student_resource/dataset/test/test_source3.tsv"),
-        help="Path to Source 3 TSV",
+        default=Path("cache/normalized"),
+        help="Directory containing normalized test Parquet files",
     )
     parser.add_argument(
         "--output",
@@ -135,10 +132,22 @@ def main() -> None:
         help="Path to save candidate_pairs.tsv",
     )
     parser.add_argument(
+        "--candidate-cache-dir",
+        type=Path,
+        default=Path("cache/candidates/test_pairs"),
+        help="Directory for long-form candidate Parquet parts",
+    )
+    parser.add_argument(
         "--max-candidates",
         type=int,
         default=DEFAULT_MAX_CANDIDATES,
         help="Maximum candidates per Source 1 entity",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50_000,
+        help="Number of compact candidate rows written per Parquet part",
     )
     parser.add_argument(
         "--limit",
@@ -146,16 +155,22 @@ def main() -> None:
         default=None,
         help="Limit number of rows for testing/prototyping",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace existing candidate TSV and Parquet parts",
+    )
 
     args = parser.parse_args()
 
     run_blocking_pipeline(
-        source1_path=args.source1,
-        source2_path=args.source2,
-        source3_path=args.source3,
+        normalized_dir=args.normalized_dir,
         output_path=args.output,
+        candidate_cache_dir=args.candidate_cache_dir,
         max_candidates=args.max_candidates,
+        batch_size=args.batch_size,
         limit=args.limit,
+        force=args.force,
     )
 
 
