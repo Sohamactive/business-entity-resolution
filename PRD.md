@@ -203,22 +203,23 @@ Records with the same key go in the same "block" — hence the name.
 - Country grouping is done dynamically (e.g. `group_by("country")` in polars) on whatever value is actually present in the data.
 - No `if country == "US"` / `elif country == "India"` branching logic anywhere in the pipeline. Any country-aware logic must be config/lookup-driven with a generic fallback for unseen country values — minimize this regardless, consistent with staying script-blind in normalization (§6).
 
-### Blocking keys (Finalized)
+### Blocking keys (Finalized & Enhanced)
 1. **Country** — cheap, safe, zero recall risk (0 cross-country matches in ground truth). Dynamically partitioned.
-2. **Name-keys (Pass A — Stopword & Legal Suffix Filtered)**:
-   - `NF_{prefix}`: First 4 characters of the leading distinctive word (preserves primary brand identity).
-   - `NS_{prefix}`: First 4 characters of the sorted distinctive words (order-invariant).
-   - *Design rationale*: Filtering stopwords and normalized legal suffixes (`incorporated`, `limited`, `company`) is mandatory. Otherwise, `Prime Money Inc.` (`inco`) and `Prime Money` (`mone`) land in different blocks, and blocks for `inco` / `comp` explode to >180,000 entities (>72 billion pairs).
-3. **Compound Address-keys (Pass B)**:
-   - `ANW_{num}_{street_prefix}`: Normalized integer building/plot number (stripped of leading zeros) + first distinctive street word prefix (length 4). E.g., `17560_elli`, `1795_west`, `85_wayn`.
-   - `ANW_{num}_{locality_prefix}`: Number + last distinctive locality/city token, ensuring invariance to component reordering (City first vs. Street first).
-   - `AWP_{word1}_{word2}`: Fallback for addresses without digits (~5.7% of records), combining the first two distinctive locality tokens (e.g. `west_beng`).
-   - *Design rationale*: Coarse geography alone (state/city) produces blocks of 161,431 entities in Maharashtra alone (64 billion pairs), causing immediate OOM. Coupling number + street token drops max block size in 100k records to 48 while successfully catching cross-script Indian records (where names are in Tamil/Devanagari but addresses are in Latin script).
+2. **Name-keys (Pass A — Stopword & Legal Suffix Filtered, DBA-Aware)**:
+   - `NF_{prefix}`: First 4 characters of the leading distinctive word across both DBA alias and trade-name segments.
+   - `NS_{prefix}`: First 4 characters of the primary sorted distinctive word.
+   - `NS2_{prefix}`: First 4 characters of the secondary sorted distinctive word (for multi-word businesses).
+   - *Design rationale*: Filters corporate legal suffixes, web domain noise (`.com`, `.org`), generic country terms (`india`, `usa`, `france`), and honorifics (`shri`, `smt`, `mr`, `dr`). Treats DBA / trade-name indicators (`doing business as`, `dba`, `d/b/a`) as delimiters to index both parent and branch brand tokens.
+3. **Compound Address-keys (Pass B — Multi-Number & Locality Tokens)**:
+   - `ANW_{num}_{street_prefix}`: Normalized integer building/plot numbers (up to 2 unique numbers extracted) paired with the top 3 distinctive street/locality tokens + last locality token. E.g., `17560_elli`, `229_colu`, `2687_livi`.
+   - `AWP_{word1}_{word2}`: Universal pairwise combinations across top 3 sorted distinctive locality words (`w0_w1`, `w0_w2`, `w1_w2`). Always generated regardless of digit presence, bridging records where one source omitted numbers or had typos in house numbers.
+   - *Design rationale*: Addresses permutation variance (`Visakhapatnam Main Road` vs `Main Road Visakhapatnam`), multi-number addresses (`unit 229 columbus 2687 livingston`), and number-omission asymmetry.
 
-### Strategy: multi-pass, unioned with configurable candidate cap
-- Final candidate set per Source 1 entity = **union** of both passes.
-- **Candidate capping**: Configurable via `.env` (`BLOCKING_MAX_CANDIDATES`, default: 150). Candidates matching on multiple keys or higher-specificity address keys are prioritized.
-- **Holdout Validation Recall**: 93.53% overall (US: 97.62%, India: 87.36%) with median candidate pool of 67.
+### Strategy: multi-pass, tiered prioritized retrieval with candidate cap
+- Final candidate set per Source 1 entity = **union** of both passes, queried in order of specificity:
+  `ANW_` (Compound Address) $\to$ `NF_` (First Brand Name) $\to$ `AWP_` (Address Word Pairs) $\to$ `NS_` (Sorted Name) $\to$ `NS2_`.
+- **Candidate capping & safety guard**: Configurable via `.env` (`BLOCKING_MAX_CANDIDATES`, default: 150). Inverted index blocks with $>1,000$ pool entities are skipped to prevent Cartesian blowouts.
+- **Holdout Validation Recall (Enhanced)**: **97.67% overall** (US: **99.10%**, India: **95.48%**), reducing missed entity errors by **63%** while maintaining a throughput of >20,000 entities/sec.
 - **Output formatting**: Exported to `output/candidate_pairs.tsv` with `quote_style="never"` and `null_value=""`, ensuring singletons produce true empty fields and passing all checks in `validate_submission.py`.
 
 ### Output

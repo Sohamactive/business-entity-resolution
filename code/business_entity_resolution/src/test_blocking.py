@@ -16,7 +16,11 @@ from business_entity_resolution.src.blocking import (
     save_candidate_pairs,
     write_candidate_outputs,
 )
-from business_entity_resolution.src.normalization import normalize_address, normalize_name
+from business_entity_resolution.src.normalization import (
+    normalize_address,
+    normalize_dataframe,
+    normalize_name,
+)
 
 
 class TestBlocking(unittest.TestCase):
@@ -254,6 +258,69 @@ class TestBlocking(unittest.TestCase):
             lines = tsv_path.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 3)
             self.assertEqual(lines[2], "S1-002\t")
+
+    def test_dba_trade_name_splitting(self):
+        """Test that DBA and 'doing business as' entities share keys with their trade name."""
+        keys_alias = extract_name_keys("lyravera dba jeniece glass incorporated")
+        keys_brand = extract_name_keys("jeniece glass incorporated")
+        # Both must contain 'NF_jeni' (from jeniece)
+        self.assertTrue(any("jeni" in k for k in keys_alias))
+        self.assertTrue(any("jeni" in k for k in keys_brand))
+        self.assertTrue(bool(set(keys_alias) & set(keys_brand)))
+
+    def test_multi_number_address_matching(self):
+        """Test that addresses with multiple numbers match regardless of number ordering."""
+        keys_s1 = extract_address_keys("unit 229 columbus 2687 livingston avenue oh")
+        keys_s3 = extract_address_keys("2687 livingston avenue unit 229 columbus oh")
+        # Both have 229 and 2687, and should share ANW_ keys
+        common_keys = set(keys_s1) & set(keys_s3)
+        self.assertTrue(len(common_keys) > 0)
+
+    def test_number_vs_no_number_universal_awp(self):
+        """Test that an address with a number shares AWP keys with one without a number."""
+        keys_num = extract_address_keys("306 wrights lane bldg brian griffith dentistry prestonsburg ky")
+        keys_no_num = extract_address_keys("prestonsburg bldg brian griffith dentistry kentucky wrights lane")
+        # Universal AWP ensures both generate word pair keys from distinctive words
+        common_keys = set(keys_num) & set(keys_no_num)
+        self.assertTrue(len(common_keys) > 0)
+        self.assertTrue(any(k.startswith("AWP_") for k in common_keys))
+
+    def test_honorific_and_country_stopwords(self):
+        """Test that Indian honorifics (Smt, Shri) and generic countries do not become primary keys."""
+        keys = extract_name_keys("smt radhika traders india private limited")
+        # 'smt', 'india', 'private', 'limited' are filtered, leaving 'radhika' and 'traders'
+        self.assertFalse(any(k.endswith("_smt") or k.endswith("_indi") for k in keys))
+        self.assertTrue(any(k.endswith("_radh") for k in keys))
+
+    def test_open_set_multi_country_scalability(self):
+        """Test that the pipeline seamlessly scales to unseen countries (Australia, Germany, Japan, France)."""
+        s1 = pl.DataFrame({
+            "entity_id": ["S1-AUS-001", "S1-DEU-002", "S1-JPN-003", "S1-FRA-004"],
+            "business_name": ["Sydney Harbour Cafe Pty Ltd", "Berliner Bäckerei GmbH", "Tokyo Sushi Bar", "Boulangerie Parisienne SAS"],
+            "business_address": ["42 George Street Sydney NSW 2000", "15 Friedrichstraße Berlin", "1-2-3 Shibuya Tokyo", "10 Rue de la Paix Paris"],
+            "country": ["Australia", "Germany", "Japan", "France"]
+        })
+        pool = pl.DataFrame({
+            "entity_id": ["S2-AUS-101", "S2-DEU-201", "S2-JPN-301", "S3-FRA-401", "S2-USA-999"],
+            "business_name": ["Sydney Harbour Café", "Berliner Baeckerei", "Tokyo Sushi", "Boulangerie Paris", "Sydney Coffee USA"],
+            "business_address": ["42 George St Sydney", "15 Friedrichstrasse Berlin", "1-2-3 Shibuya Tokyo", "10 Rue de la Paix Paris", "42 George St New York"],
+            "country": ["Australia", "Germany", "Japan", "France", "US"]
+        })
+
+        s1_norm = normalize_dataframe(s1)
+        pool_norm = normalize_dataframe(pool)
+
+        index = BlockingIndex()
+        index.add_dataframe(pool_norm)
+
+        cand_df = block_source1_against_index(s1_norm, index)
+        cand_map = dict(zip(cand_df["source1_entity_id"], cand_df["candidate_entity_ids"]))
+
+        # Australia S1 matches Australia candidate, ignores identical US address
+        self.assertEqual(cand_map["S1-AUS-001"], "S2-AUS-101")
+        self.assertEqual(cand_map["S1-DEU-002"], "S2-DEU-201")
+        self.assertEqual(cand_map["S1-JPN-003"], "S2-JPN-301")
+        self.assertEqual(cand_map["S1-FRA-004"], "S3-FRA-401")
 
 
 if __name__ == "__main__":
