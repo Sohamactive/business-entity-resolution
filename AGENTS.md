@@ -1,143 +1,156 @@
-# AGENTS.md — ML Challenge 2026: Business Entity Resolution
+# AGENTS.md — Business Entity Resolution (Amazon ML Challenge 2026)
 
-## Mission
+This file gives any AI coding agent (Claude Code, Cursor, etc.) working on this repo the context
+needed to continue without re-deriving decisions already made. Read this before writing code.
+Full rationale for every decision below lives in `PRD.md` — this file is the condensed,
+agent-facing version.
 
-Build a reproducible ML pipeline for the Amazon ML Challenge 2026 Business Entity Resolution task. Source 1 is the deduplicated reference set. For each Source 1 entity, find all matching records in Source 2 and Source 3. A Source 1 entity may have zero, one, or many matches.
+---
 
-## Authoritative materials
+## Project summary
 
-Use the official problem statement, challenge instructions, supplied dataset, README, validator, and methodology template as the project sources of truth. Do not invent dataset statistics, challenge requirements, experimental results, or findings. Mark unknowns as TODO until measured or confirmed.
+Entity resolution task: match business records from **Source 1** (deduplicated reference, 2.2M
+train / 1.7M test entities) against noisy records from **Source 2** and **Source 3** (~5M each).
+A Source 1 entity may match zero, one, or many Source 2/3 records. Output is scored by **F_0.5**
+(precision weighted 2× over recall), computed per-entity and macro-averaged.
 
-## Challenge constraints
+**Team goal:** top-100 leaderboard finish. **Deadline:** challenge ends Sept 27, 11:59 PM IST.
 
-- Use only the supplied challenge data for resolving entities. No external databases, APIs, business lookup, geocoding, or internet data augmentation.
-- The final model must satisfy the stated MIT/Apache 2.0 license requirement and be no larger than 8 billion parameters. Check model license before use.
-- Training countries include US and India; test also includes France. Treat country as an open-set string value. Do not hard-code, filter, or encode only the training country set. Include every test Source 1 entity.
-- Challenge runs from Sep 25, 2026 00:00 IST to Sep 27, 2026 23:59 IST. Maximum five leaderboard submissions per day across the three days. Preserve submission versions.
-- Use laptop/desktop; no simultaneous logins per participant.
+---
 
-## Data layout and schema
+## Hard constraints — never violate these
 
-```text
-dataset/
-├── train/
-│   ├── train_source1.tsv
-│   ├── train_source2.tsv
-│   ├── train_source3.tsv
-│   └── train_ground_truth.tsv
-└── test/
-    ├── test_source1.tsv
-    ├── test_source2.tsv
-    └── test_source3.tsv
+- **No external data lookups.** No APIs, no geocoding, no business registry lookups, no internet
+  augmentation of any kind at runtime. Instant disqualification if found. Using an AI coding
+  assistant to *write* code is fine — the pipeline itself must never call out to external
+  services to resolve entities.
+- **Final model:** must be MIT or Apache 2.0 licensed, **≤ 8B parameters**. No proprietary/closed
+  model APIs as the final matching model.
+- **Country is an open set.** Training data has US/India only; test data adds France. Never
+  hardcode a country list (`["US","India","France"]`), never write `if country == "US"` branching
+  logic. Any country-aware behavior must be config/lookup-driven with a generic fallback for
+  unseen values.
+- **Output files, exact paths:** `output/matching_results.tsv`, `output/candidate_pairs.tsv`
+  (tab-separated, not comma). Header names must match exactly:
+  - `matching_results.tsv`: `source1_entity_id`, `matched_entity_ids`
+  - `candidate_pairs.tsv`: `source1_entity_id`, `candidate_entity_ids`
+- **One row per Source 1 test entity, no exceptions** (empty `matched_entity_ids` for
+  singletons). No duplicate entity IDs within a list. No duplicate `source1_entity_id` rows.
+  `matched_entity_ids` must only reference S2-/S3- IDs, never S1- (self-match = rejected).
+- **Always run `utils/validate_submission.py` before treating any output as submission-ready.**
+  It only checks format, never computes score — see `PRD.md §9.1` for what it does and doesn't
+  catch.
+
+---
+
+## Architecture decisions already made (do not re-derive — see PRD.md for full rationale)
+
+### Pipeline (the funnel)
+```
+raw data → normalize → block → candidate_pairs.tsv → feature engineering →
+match/no-match decision → matching_results.tsv → validate_submission.py → submit
 ```
 
-All files are tab-separated. Always load with an explicit separator:
+### Normalization (`PRD.md §6`)
+- **Script-blind.** One shared normalization function for every language/script (English, Hindi,
+  Punjabi, Southern Indian languages, French). No per-language branching, no transliteration, no
+  translation (translation risks brushing against the external-lookup rule anyway — avoid).
+- Steps: Unicode **NFKC** normalize → lowercase → strip punctuation (`&`→`and`, not deleted) →
+  collapse whitespace → (optional/low-priority) digit normalization in addresses.
+- Legal-suffix lookup dictionary (`Pvt`→`Private`, `Ltd`→`Limited`, `Corp`→`Corporation`, etc.)
+  applied where it matches — harmless no-op on non-Latin scripts, don't build per-language suffix
+  dictionaries.
+- No script detection/tagging in Iteration 1 — add only as a diagnostic if validation (see below)
+  shows a specific country/language underperforming.
+- **Known limitation, accepted deliberately:** character n-gram similarity cannot match the same
+  business recorded in two different scripts across sources (e.g. Devanagari vs. Latin
+  transliteration) — this is a silent recall risk, not a crash. Detection method below.
+- Output columns: `normalized_name`, `normalized_address` — everything downstream reads from
+  these, never raw columns.
 
-```python
-import pandas as pd
-df = pd.read_csv(path, sep="\t")
+### Blocking (`PRD.md §7`)
+- Two keys, computed from normalized fields:
+  - **name_key** — sorted-token prefix (split name into words, sort alphabetically, join, take
+    first N chars) — order-invariant.
+  - **address_key** — coarse geography token (e.g. city/state segment) from the address.
+- **Two blocking passes, unioned, not a single combined key:**
+  - Pass A: group by `(country, name_key)`
+  - Pass B: group by `(country, address_key)`
+  - Final candidates per S1 entity = union of both passes.
+- Rationale: name and address noise fail independently; union protects recall (blocking misses
+  are unrecoverable downstream; extra candidates just get filtered later).
+- Implementation: **polars**, not pandas, for these joins (multi-million-row scale).
+- Output = `candidate_pairs.tsv`, exactly the set fed to the matching stage — not an earlier,
+  unfiltered blocking pass.
+
+### Feature engineering & matching (`PRD.md §8`)
+- **String similarity: trigram (character n-gram) Jaccard** for Iteration 1 — script-agnostic,
+  word-order robust, vectorizable. `difflib.SequenceMatcher` rejected (not vectorizable, order
+  sensitive). TF-IDF char-n-gram + cosine is the planned Iteration 2/3 upgrade (smarter weighting,
+  same script-agnostic property) — **flagged for further discussion, not finalized**.
+- Features per candidate pair: `name_similarity`, `address_similarity`, `country_match` (binary),
+  optional length-difference sanity features.
+- **Iteration 1 — threshold rule, no trained model:**
+  ```
+  combined_score = 0.6 * name_similarity + 0.4 * address_similarity
+  is_match = combined_score > threshold
+  ```
+  Threshold tuned against internal holdout F_0.5 (not accuracy).
+- An S1 entity can have multiple true matches — keep **every** candidate above threshold, not
+  just the top one.
+- **Iteration 3+ (once blocking/features trusted):** swap threshold rule for **LightGBM/XGBoost**
+  trained on the same features, labels from `train_ground_truth.tsv`. Satisfies license/size
+  constraint trivially.
+
+### Internal validation (`PRD.md §9`)
+- `validate_submission.py` = format safety only. Never computes F_0.5. Run before every
+  submission regardless.
+- Real score estimation = our own holdout split from `train_source1.tsv` +
+  `train_ground_truth.tsv`. Compute F_0.5 per-entity, macro-averaged, exactly matching the
+  competition formula.
+- **Always break down holdout F_0.5 by `country`, and by precision vs. recall separately** — not
+  just one blended number. Low recall for a country → likely a blocking/cross-script miss (see
+  Normalization limitation above). Low precision → threshold/feature problem, unrelated to
+  script. Manually inspect actual missed/wrong cases before concluding the cause.
+
+### Compute environment
+- **Kaggle notebooks = primary** (30 hrs/week, stable sessions, dataset mounted at
+  `/kaggle/input/<dataset-name>/dataset/...`, no re-upload needed).
+- **Colab (free tier) = secondary/parallel**, for smaller tasks only — free tier disconnects on
+  idle, unreliable for long blocking jobs.
+- **SageMaker = deferred**, not part of Iteration 1/2. Only reconsider if a GPU-bound step (e.g.
+  embedding-based similarity at scale) becomes the actual bottleneck later. $150 AWS credit kept
+  in reserve for that scenario.
+- **Data priority:** Kaggle dataset (primary, for compute) → local machine (source of truth for
+  code, git) → Google Drive (fallback/secondary access only).
+
+---
+
+## Repo structure (current)
+```
+code/business-entity-resolution/src/   # pipeline source — build here
+data/student_resource/dataset/         # local copy of train/test data
+notebooks/                             # exploratory work
+outputs/                               # matching_results.tsv, candidate_pairs.tsv go here
+PRD.md                                 # full rationale, decision history, open questions
+Documentation_template.md              # methodology write-up — fill in as you build, not at the end
+main.py
 ```
 
-Each source record has `entity_id`, `business_name`, `business_address`, and `country`. The source is indicated by its file and ID prefix (`S1-`, `S2-`, `S3-`), not a separate source column.
+## Explicitly open / unresolved — do not assume, flag instead
+- **Documentation length conflict**: problem statement says no page limit; guidelines doc says
+  1-2 pages for the initial required artefact. Unresolved — ask the team before finalizing
+  `Documentation_template.md` length.
+- **"Eligibility criteria"** referenced in guidelines doc for top-100 announcement, never
+  defined in either source doc. Unresolved.
+- **TF-IDF char n-gram upgrade (Iteration 2/3)** — flagged for further discussion, not committed.
+- **Address-key exact extraction logic** — not yet finalized against real address format
+  variety; needs a real-data pass before locking in.
 
-`train_ground_truth.tsv` has `source1_entity_id` and `matched_entity_ids`. The latter is a comma-separated list of matching S2/S3 IDs; an empty value means no matches. Test labels are not provided.
-
-## Definitions
-
-- **Blocking / candidate generation:** shortlist plausible Source 2 and Source 3 records for each Source 1 record before the final matching decision.
-- **Candidate pair:** a Source 1-to-Source 2 or Source 1-to-Source 3 comparison passed to the matching model.
-- **Final match:** a candidate the system predicts to be the same real-world business.
-- **Singleton/no-match:** a Source 1 entity with no correct matches.
-
-The `candidate_pairs.tsv` file must record the final candidate set actually passed to the inference matching model, not an earlier, broader blocking output. Every predicted final match must be included in that entity's candidate list.
-
-## Recommended workflow — proceed one milestone at a time
-
-1. **Read project materials and inspect data.** Confirm file paths, columns, row counts, nulls, ID uniqueness, country values, and label-list format. Show only small samples. Keep raw files unchanged.
-2. **Create a reproducible validation split from training.** Hold out Source 1 entities and their labels. Ensure no held-out labels leak into fitting or threshold selection. Test has no ground truth.
-3. **Implement a simple, transparent baseline.** Start with conservative text normalization, straightforward blocking, name/address similarity features, and an initial threshold. Do not begin with a large model or automated tuning.
-4. **Evaluate using the official metric.** Compute F0.5 per Source 1 entity and macro-average across entities. Track precision and recall as diagnostics; explicitly evaluate correct empty predictions and false matches on true singletons.
-5. **Inspect errors.** Review false positives, false negatives, missed true candidates, and erroneous non-empty predictions for true singletons.
-6. **Improve blocking.** Experiment with blocking keys and string-based retrieval such as token overlap/Jaccard, edit distance, or TF-IDF cosine. Measure candidate recall and candidate-set size; remember missed candidates cap final recall.
-7. **Improve matching.** Add justified name/address features and, if validation evidence supports it, train a pairwise classifier. Tune thresholds only on validation data, prioritizing the official F0.5 objective without ignoring candidate recall.
-8. **Run controlled experiments.** Keep the same validation split. Record configuration, blocking strategy, features/model, threshold, score, and notes for each experiment. Change one major factor at a time where practical.
-9. **Run test inference.** Predict for every test Source 1 record against test Sources 2 and 3. Preserve valid IDs and output empty lists where appropriate.
-10. **Validate and package.** Create both required TSVs, run the supplied validator, then assemble the final ZIP. Do not spend leaderboard submissions on avoidable formatting errors.
-
-Use CPU-friendly methods first. Consider GPU, distributed processing, or SageMaker automatic hyperparameter tuning only after a valid baseline exists and measurements show a benefit or bottleneck.
-
-## Metric
-
-The official metric is macro-averaged F-beta with beta = 0.5. It is precision-heavy and penalizes false merges. Singletons count in the macro-average: a correct empty prediction scores 1.0 for that entity; any predicted match for a true singleton scores 0.0. Optimize and report the actual challenge metric, not just pairwise accuracy.
-
-## Required prediction files
-
-Both files are tab-separated and belong in `output/`:
-
-- `matching_results.tsv`: columns `source1_entity_id`, `matched_entity_ids`. Exactly one row for every test Source 1 ID. Values are comma-separated S2/S3 IDs or empty. No duplicates; IDs must exist in test S2/S3.
-- `candidate_pairs.tsv`: columns `source1_entity_id`, `candidate_entity_ids`. Exactly one row per test Source 1 ID. Values are comma-separated S2/S3 candidate IDs or empty. No duplicates; IDs must exist in test S2/S3. Final matches must be a subset of candidates.
-
-The leaderboard upload is `matching_results.tsv`. The final archive additionally includes `candidate_pairs.tsv`, runnable code, dependency pins, and the completed methodology document.
-
-## Final archive structure
-
-```text
-<team_name>_submission.zip
-├── output/
-│   ├── matching_results.tsv
-│   └── candidate_pairs.tsv
-├── code/
-│   └── business_entity_resolution/
-│       ├── src/
-│       ├── README.md
-│       └── requirements.txt
-└── Documentation_template.md
-```
-
-The code folder must be self-contained and document exact end-to-end run instructions. Pin dependencies. Keep raw data separate from generated outputs and avoid committing credentials or private data to a public repository.
-
-## Submission validator
-
-Run from the extracted `student_resource/` directory, adjusting relative paths only if the working layout differs:
-
-```bash
-python3 utils/validate_submission.py \
-  --matching output/matching_results.tsv \
-  --candidate output/candidate_pairs.tsv \
-  --test-dir dataset/test
-```
-
-The validator checks file structure and ID constraints; it does not calculate F0.5.
-
-## Methodology write-up template
-
-Fill the supplied `Documentation_template.md`; do not fabricate or prematurely fill in results. Keep this structure and update bracketed prompts with measured, accurate information:
-
-1. **Team details:** team name, team members, submission date.
-2. **Executive Summary:** 2–3 sentences describing the actual approach and key innovations.
-3. **Methodology**
-   - **Problem Analysis:** EDA findings about noise, address/name variation, missing fields, etc.
-   - **Solution Strategy:** approach type (e.g. blocking + classifier, end-to-end, graph-based, hybrid) and actual core innovation.
-4. **Candidate Generation (Blocking):** blocking keys, total candidate pairs, and how candidate recall was assessed/protected.
-5. **Matching Model:** name, address, and other features; model type; validation-based threshold selection method.
-6. **Results & Error Analysis:** best macro F0.5 validation score and observed false-positive/false-negative patterns.
-7. **Conclusion:** 2–3 sentences on actual approach, results, and lessons.
-8. **Appendix**
-   - **Code Artefacts:** summarize source structure and exact entry point(s) for reproducing both output files.
-   - **Additional Results:** optional additional charts/tables/details.
-
-The challenge instructions request a 1–2 page approach document; the problem statement says the provided methodology template has no page limit and prioritizes clarity and technical depth. Follow any current portal instructions and keep the write-up clear and complete.
-
-## Engineering and collaboration
-
-- Use small, documented modules under `src/` (e.g. loading, normalization, blocking, features/scoring, evaluation, inference, output writing).
-- Make paths configurable; avoid machine-specific absolute paths.
-- Fix random seeds for reproducibility.
-- Avoid validation leakage.
-- Keep a simple experiment log and preserve submission versions.
-- Use Git branches or clearly assigned workstreams when collaborating; integrate and test changes before submission.
-- Do not claim a model, score, result, or finding until it has actually been run and checked.
-
-## Immediate next action
-
-Inspect the actual training and test files and report their real columns, row counts, missingness, and label representation. Then proceed to a reproducible validation split. Do not assume illustrative examples in the challenge documents are actual data.
+## Working conventions
+- Every pipeline change → re-run internal holdout validation (§9 above) before considering a
+  real leaderboard submission — submissions are limited to 15 total (5/day × 3 days).
+- Keep a version-history log of every leaderboard submission (timestamp, what changed, holdout
+  F_0.5, public leaderboard F_0.5) — required for shortlisting review.
+- Fill in `Documentation_template.md` incrementally as decisions are made, not as a last-minute
+  writeup — it doubles as the audit-time methodology doc for top-100 teams.
