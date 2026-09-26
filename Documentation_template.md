@@ -49,17 +49,17 @@ To maximize recall while keeping blocks compact, we compute complementary keys a
    - Keys are indexed as `(country, block_key)`. Cross-country matching is prevented at the index level without hardcoding country strings.
 
 ### 3.2 Candidate Pairs Generated & Statistics
-- **Total candidate pool per entity**: Median = 67, Mean = 75.1, 95th Percentile = 150, Max = 150 (enforced via configurable `.env` cap `BLOCKING_MAX_CANDIDATES=150`).
-- **Reduction Ratio**: >99.999% reduction in pairwise comparison space (from $1.7 \times 10^{13}$ to $<1.2 \times 10^8$ total pairs).
-- **Execution Throughput**: >40,000 entities/sec using Polars inverted indexing.
+- **Total candidate pool per entity**: Median = 144, Mean = 107.1, 95th Percentile = 150, Max = 150 (enforced via configurable `.env` cap `BLOCKING_MAX_CANDIDATES=150`).
+- **Reduction Ratio**: >99.999% reduction in pairwise comparison space (from $1.7 \times 10^{13}$ to $<1.8 \times 10^8$ total pairs).
+- **Execution Throughput**: >20,000 entities/sec using prioritized inverted indexing.
 
 ### 3.3 How True Matches Were Preserved (Recall Guarantee)
-- **Union Architecture**: Name and address noise fail independently. Candidates from Pass A and Pass B are unioned.
-- **Cross-Script Recovery**: Devanagari/Tamil business records whose names cannot match Latin S1 records are retrieved via the compound address key (`ANW_`).
-- **Holdout Validation Recall**:
-  - Combined Blocking Recall: **93.53%** overall.
-  - US Blocking Recall: **97.62%**.
-  - India Blocking Recall: **87.36%**.
+- **Union Architecture**: Name and address noise fail independently. Candidates from Pass A (DBA-aware name keys) and Pass B (compound address keys) are unioned across priority tiers.
+- **Cross-Script Recovery**: Devanagari/Tamil business records whose names cannot match Latin S1 records are retrieved via multi-number compound address keys (`ANW_`) and universal address word pairs (`AWP_`).
+- **Holdout Validation Recall (Enhanced)**:
+  - Combined Blocking Recall: **97.67%** overall (error reduction of 63% vs initial baseline).
+  - US Blocking Recall: **99.10%**.
+  - India Blocking Recall: **95.48%**.
 - **Format Compliance**: Output written with `quote_style="never"` and `null_value=""`, ensuring singletons produce clean empty strings and passing all checks in `utils/validate_submission.py`.
 
 ---
@@ -78,10 +78,10 @@ To maximize recall while keeping blocks compact, we compute complementary keys a
 
 ## 5. Results & Error Analysis
 
-- **Candidate Recall (Holdout):** 93.53% (US: 97.62%, India: 87.36%)
+- **Candidate Recall (Holdout):** 97.67% (US: 99.10%, India: 95.48%)
 - **F_0.5 Score (macro):** [To be populated after model training]
 - **Common false positives (wrong merges):** Franchises / branch locations sharing identical business names and partial street names in the same city.
-- **Common false negatives (missed matches):** Cross-script records that simultaneously possess no address numbers and non-Latin business names.
+- **Common false negatives (missed matches):** Rare entities with simultaneous extreme character corruption across all fields and no recognizable locality words.
 
 ---
 

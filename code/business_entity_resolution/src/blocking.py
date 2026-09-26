@@ -22,7 +22,9 @@ Design Rationale:
 
 from __future__ import annotations
 
+import itertools
 import os
+import re
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -52,6 +54,15 @@ NAME_STOPWORDS = {
     "industries", "industry", "technologies", "technology", "tech",
     "management", "partners", "partner", "associates", "associate",
     "consulting", "consultants", "consultant", "international", "national",
+    "global", "commercial", "trading", "operating",
+    # DBA / Alias connectives & noise
+    "dba", "doing", "business", "as",
+    # Web & Domain noise
+    "com", "org", "net", "www", "io",
+    # Country / Geographic Noise in Business Names (frequent non-distinctive descriptors)
+    "india", "indian", "usa", "america", "american", "france", "french",
+    # Common Honorifics in Indian Business Names
+    "shri", "sri", "smt", "dr", "mr", "mrs", "ms",
 }
 
 # Generic address descriptors that do not uniquely distinguish a street / locality
@@ -66,7 +77,9 @@ ADDRESS_STOPWORDS = {
     "apt", "apartment", "suite", "ste", "room", "rm", "sector", "sec",
     "block", "blk", "phase", "nagar", "colony", "enclave", "building", "bldg",
     "complex", "tower", "po", "box", "pob", "post", "near", "opp", "opposite",
-    "behind", "beside", "bh", "null", "none", "na",
+    "behind", "beside", "bh", "null", "none", "na", "door",
+    # Directional Descriptors
+    "north", "south", "east", "west", "central", "new", "old",
     # Connectives
     "and", "the", "of", "in", "at", "on", "to", "for",
 }
@@ -75,76 +88,88 @@ ADDRESS_STOPWORDS = {
 def extract_name_keys(normalized_name: str, prefix_len: int = 4) -> list[str]:
     """Extract complementary blocking keys from a normalized business name.
 
+    Handles trade-name / DBA splits and secondary brand tokens.
     Returns:
-        A list containing:
-        - N_FIRST: First 4 characters of the leading distinctive word.
-        - N_SORT: First 4 characters of the alphabetically first distinctive word.
+        - NF_: First prefix_len characters of leading distinctive word(s).
+        - NS_: First prefix_len characters of primary sorted distinctive word.
+        - NS2_: First prefix_len characters of secondary sorted distinctive word (if present).
     """
     if not normalized_name:
         return []
 
-    tokens = normalized_name.split()
-    # Filter stopwords and single-character noise
-    distinctive = [t for t in tokens if t not in NAME_STOPWORDS and len(t) >= 2]
-    if not distinctive:
-        # Fallback to any token if all were filtered
-        distinctive = [t for t in tokens if len(t) >= 1]
+    # Split on DBA / trade-name indicators
+    parts = re.split(r"\b(?:dba|doing business as|d/b/a|t/a|trading as)\b", normalized_name)
 
-    if not distinctive:
-        return []
+    keys: list[str] = []
+    all_distinctive: list[str] = []
 
-    keys: set[str] = set()
+    for part in parts:
+        tokens = [
+            t for t in part.split()
+            if t not in NAME_STOPWORDS and len(t) >= 2 and re.search(r"\w", t)
+        ]
+        if tokens:
+            keys.append(f"NF_{tokens[0][:prefix_len]}")
+            all_distinctive.extend(tokens)
 
-    # 1. First distinctive word prefix (preserves brand identity)
-    first_word = distinctive[0]
-    keys.add(f"NF_{first_word[:prefix_len]}")
+    if not all_distinctive:
+        # Fallback to any token with alphanumeric characters if all were stopwords
+        tokens = [t for t in normalized_name.split() if len(t) >= 1 and re.search(r"\w", t)]
+        if tokens:
+            keys.append(f"NF_{tokens[0][:prefix_len]}")
+            all_distinctive.extend(tokens)
 
-    # 2. Sorted distinctive word prefix (handles word-order swaps)
-    sorted_word = sorted(distinctive)[0]
-    keys.add(f"NS_{sorted_word[:prefix_len]}")
+    if all_distinctive:
+        sorted_distinct = sorted(list(set(all_distinctive)))
+        keys.append(f"NS_{sorted_distinct[0][:prefix_len]}")
+        if len(sorted_distinct) > 1:
+            keys.append(f"NS2_{sorted_distinct[1][:prefix_len]}")
 
-    return list(keys)
+    return list(dict.fromkeys(keys))
 
 
 def extract_address_keys(normalized_address: str, prefix_len: int = 4) -> list[str]:
     """Extract compound blocking keys from a normalized address.
 
-    Pairs the building/house/plot number with the street or locality prefix to
-    prevent Cartesian block explosions while enabling cross-script name recovery.
+    Pairs up to 2 building/plot numbers with top distinctive locality tokens (ANW_)
+    and generates universal sorted token-pair keys (AWP_) to bridge missing numbers.
     """
     if not normalized_address:
         return []
 
     tokens = normalized_address.split()
 
-    # Extract clean integers (strip leading zeros like '0017560' -> '17560')
+    # Extract unique positive integers (strip leading zeros like '0017560' -> '17560')
     nums: list[str] = []
     for t in tokens:
         if t.isdigit() and 1 <= len(t) <= 8:
             val = int(t)
-            if val > 0:
+            if val > 0 and str(val) not in nums:
                 nums.append(str(val))
 
-    # Extract distinctive words (non-digits, not in stopword list, min length 3)
+    # Extract distinctive words (non-digits, not in stopword list, min length 3, has word chars)
     words = [
         t for t in tokens
-        if not t.isdigit() and t not in ADDRESS_STOPWORDS and len(t) >= 3
+        if not t.isdigit() and t not in ADDRESS_STOPWORDS and len(t) >= 3 and re.search(r"\w", t)
     ]
 
-    keys: set[str] = set()
+    keys: list[str] = []
 
+    # Pass 1: ANW_ compound keys (cross up to 2 numbers with top 3 distinctive words + last word)
     if nums and words:
-        # ANW: Number + first distinctive street/locality token
-        keys.add(f"ANW_{nums[0]}_{words[0][:prefix_len]}")
-        # If multiple words exist, also add number + last distinctive locality/city token
-        # Using the same ANW_ prefix ensures component reordering (e.g. City first vs Street first) matches!
-        if len(words) > 1:
-            keys.add(f"ANW_{nums[0]}_{words[-1][:prefix_len]}")
-    elif not nums and len(words) >= 2:
-        # Fallback for addresses without digits: pair of first two distinctive words
-        keys.add(f"AWP_{words[0][:prefix_len]}_{words[1][:prefix_len]}")
+        for num in nums[:2]:
+            for w in words[:3]:
+                keys.append(f"ANW_{num}_{w[:prefix_len]}")
+            if len(words) > 3:
+                keys.append(f"ANW_{num}_{words[-1][:prefix_len]}")
 
-    return list(keys)
+    # Pass 2: Universal AWP_ (sorted word pair combinations across top 3 words)
+    if len(words) >= 2:
+        sorted_w = sorted(list(set(words)))[:3]
+        for a, b in itertools.combinations(sorted_w, 2):
+            keys.append(f"AWP_{a[:prefix_len]}_{b[:prefix_len]}")
+
+    return list(dict.fromkeys(keys))
 
 
 def extract_all_blocking_keys(
@@ -154,9 +179,9 @@ def extract_all_blocking_keys(
 ) -> list[str]:
     """Combine name and address blocking keys for a single record."""
     keys: list[str] = []
-    keys.extend(extract_name_keys(normalized_name, prefix_len=prefix_len))
     keys.extend(extract_address_keys(normalized_address, prefix_len=prefix_len))
-    return keys
+    keys.extend(extract_name_keys(normalized_name, prefix_len=prefix_len))
+    return list(dict.fromkeys(keys))
 
 
 class BlockingIndex:
@@ -204,11 +229,19 @@ class BlockingIndex:
         normalized_name: str,
         normalized_address: str,
         max_candidates: int = DEFAULT_MAX_CANDIDATES,
+        max_block_size: int = 1000,
     ) -> list[str]:
         """Query matching candidate entity IDs for a Source 1 record.
 
-        Candidates matching multiple keys or higher-specificity address keys
-        are prioritized before applying max_candidates.
+        Retrieval is prioritized across specificity tiers:
+        Tier 1: ANW_ (Address + Number compound)
+        Tier 2: NF_ (First brand token prefix)
+        Tier 3: AWP_ (Address Word Pair combinations)
+        Tier 4: NS_ (Primary sorted brand token)
+        Tier 5: NS2_ (Secondary sorted brand token)
+        Other keys as residual.
+
+        Blocks with more than max_block_size entries are skipped as uninformative.
         """
         country_clean = str(country).strip() if country is not None else ""
         keys = extract_all_blocking_keys(normalized_name or "", normalized_address or "")
@@ -216,27 +249,42 @@ class BlockingIndex:
         if not keys:
             return []
 
-        # Count match occurrences per candidate ID for prioritization
-        hit_counts: dict[str, int] = defaultdict(int)
-        for key in keys:
-            matched_ids = self._index.get((country_clean, key))
-            if matched_ids:
-                # Add higher weight for compound address key matches
-                weight = 2 if key.startswith("ANW_") else 1
-                for mid in matched_ids:
-                    hit_counts[mid] += weight
+        # Partition keys into prioritized tiers
+        tier1 = [k for k in keys if k.startswith("ANW_")]
+        tier2 = [k for k in keys if k.startswith("NF_")]
+        tier3 = [k for k in keys if k.startswith("AWP_")]
+        tier4 = [k for k in keys if k.startswith("NS_")]
+        tier5 = [k for k in keys if k.startswith("NS2_")]
+        tier_other = [
+            k for k in keys
+            if not (k.startswith("ANW_") or k.startswith("NF_") or k.startswith("AWP_") or k.startswith("NS_") or k.startswith("NS2_"))
+        ]
 
-        if not hit_counts:
-            return []
+        candidates: list[str] = []
+        seen: set[str] = set()
 
-        # Prioritize candidates with highest hit counts
-        sorted_candidates = sorted(
-            hit_counts.keys(),
-            key=lambda cid: hit_counts[cid],
-            reverse=True,
-        )
+        for tier in (tier1, tier2, tier3, tier4, tier5, tier_other):
+            for key in tier:
+                matched_ids = self._index.get((country_clean, key))
+                if matched_ids and len(matched_ids) <= max_block_size:
+                    for cid in matched_ids:
+                        if cid not in seen:
+                            seen.add(cid)
+                            candidates.append(cid)
+                            if len(candidates) >= max_candidates:
+                                return candidates
+                elif matched_ids and len(matched_ids) > max_block_size:
+                    # Guard: If no candidates found yet, sample up to 20 from large blocks
+                    if len(candidates) == 0:
+                        for cid in matched_ids[:20]:
+                            if cid not in seen:
+                                seen.add(cid)
+                                candidates.append(cid)
 
-        return sorted_candidates[:max_candidates]
+            if len(candidates) >= max_candidates:
+                break
+
+        return candidates[:max_candidates]
 
 
 def block_source1_against_index(
