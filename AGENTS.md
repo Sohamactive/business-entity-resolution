@@ -47,7 +47,7 @@ A Source 1 entity may match zero, one, or many Source 2/3 records. Output is sco
 
 ### Pipeline (the funnel)
 ```
-raw data → normalize → block → candidate_pairs.tsv → feature engineering →
+raw data → normalize → block → candidate_pairs.tsv + candidate Parquet parts → feature engineering →
 match/no-match decision → matching_results.tsv → validate_submission.py → submit
 ```
 
@@ -69,25 +69,34 @@ match/no-match decision → matching_results.tsv → validate_submission.py → 
   these, never raw columns.
 
 ### Blocking (`PRD.md §7`)
-- Two keys, computed from normalized fields:
+- Keys are computed from normalized fields and grouped dynamically by country:
   - **name_key** — sorted-token prefix (split name into words, sort alphabetically, join, take
     first N chars) — order-invariant.
   - **address_key** — coarse geography token (e.g. city/state segment) from the address.
-- **Two blocking passes, unioned, not a single combined key:**
+- **Multi-pass retrieval, unioned and prioritized:**
   - Pass A: group by `(country, name_key)`
   - Pass B: group by `(country, address_key)`
   - Final candidates per S1 entity = union of both passes.
-- Rationale: name and address noise fail independently; union protects recall (blocking misses
-  are unrecoverable downstream; extra candidates just get filtered later).
-- Implementation: **polars**, not pandas, for these joins (multi-million-row scale).
+- Rationale: name and address noise fail independently; blocking misses are unrecoverable
+  downstream, while extra candidates can still be filtered by features.
+- Implementation: Polars plus an in-memory inverted index for fast multi-million-row lookup.
 - Output = `candidate_pairs.tsv`, exactly the set fed to the matching stage — not an earlier,
   unfiltered blocking pass.
+- Normalized source caches are stored as Parquet and reused by blocking; normalization is not
+  repeated on every blocking run.
+- Full test blocking completed: 1,732,544 Source 1 rows produced 224,533,181 long-form
+  candidate pairs in approximately 5.5 minutes on the local machine.
+- Required compact output: `output/candidate_pairs.tsv` with one row per test Source 1 entity.
+- Internal cache: `cache/candidates/test_pairs/part-*.parquet`, containing only
+  `source1_entity_id` and `candidate_id`. Feature engineering joins metadata later in bounded
+  batches; blocking must not repeatedly join the full Source 2/3 pool.
+- The current `BlockingIndex` is an in-memory inverted dictionary used for speed. Candidate
+  generation and cache writing are batched; the full index remains resident for the run.
 
 ### Feature engineering & matching (`PRD.md §8`)
-- **String similarity: trigram (character n-gram) Jaccard** for Iteration 1 — script-agnostic,
-  word-order robust, vectorizable. `difflib.SequenceMatcher` rejected (not vectorizable, order
-  sensitive). TF-IDF char-n-gram + cosine is the planned Iteration 2/3 upgrade (smarter weighting,
-  same script-agnostic property) — **flagged for further discussion, not finalized**.
+- **String similarity: character TF-IDF + cosine similarity** from Iteration 1. Use sparse,
+  vectorized computation in bounded batches; do not vectorize each of the 224M pairs independently.
+  `difflib.SequenceMatcher` and naive Python trigram-Jaccard loops are rejected at this scale.
 - Features per candidate pair: `name_similarity`, `address_similarity`, `country_match` (binary),
   optional length-difference sanity features.
 - **Iteration 1 — threshold rule, no trained model:**
@@ -98,7 +107,7 @@ match/no-match decision → matching_results.tsv → validate_submission.py → 
   Threshold tuned against internal holdout F_0.5 (not accuracy).
 - An S1 entity can have multiple true matches — keep **every** candidate above threshold, not
   just the top one.
-- **Iteration 3+ (once blocking/features trusted):** swap threshold rule for **LightGBM/XGBoost**
+- **Later iteration (once blocking/features trusted):** swap threshold rule for **LightGBM/XGBoost**
   trained on the same features, labels from `train_ground_truth.tsv`. Satisfies license/size
   constraint trivially.
 
@@ -124,14 +133,22 @@ match/no-match decision → matching_results.tsv → validate_submission.py → 
 - **Data priority:** Kaggle dataset (primary, for compute) → local machine (source of truth for
   code, git) → Google Drive (fallback/secondary access only).
 
+### Completed milestones
+- Normalized source caches to Parquet with `normalized_name` and `normalized_address`.
+- Fixed null handling so missing normalized fields are empty strings, not nulls.
+- Completed full test blocking and wrote `output/candidate_pairs.tsv`.
+- Wrote reusable long-form candidate ID Parquet parts for feature engineering.
+- Verified blocking tests and the full-scale blocking run; feature engineering is next.
+
 ---
 
 ## Repo structure (current)
 ```
-code/business-entity-resolution/src/   # pipeline source — build here
+code/business_entity_resolution/src/    # pipeline source — build here
 data/student_resource/dataset/         # local copy of train/test data
 notebooks/                             # exploratory work
-outputs/                               # matching_results.tsv, candidate_pairs.tsv go here
+output/                                # matching_results.tsv, candidate_pairs.tsv go here
+cache/                                 # generated Parquet working data
 PRD.md                                 # full rationale, decision history, open questions
 Documentation_template.md              # methodology write-up — fill in as you build, not at the end
 main.py
@@ -143,7 +160,8 @@ main.py
   `Documentation_template.md` length.
 - **"Eligibility criteria"** referenced in guidelines doc for top-100 announcement, never
   defined in either source doc. Unresolved.
-- **TF-IDF char n-gram upgrade (Iteration 2/3)** — flagged for further discussion, not committed.
+- **TF-IDF vectorizer configuration** — choose and benchmark n-gram range, vocabulary limits,
+  and fit corpus during feature-engineering implementation.
 - **Address-key exact extraction logic** — not yet finalized against real address format
   variety; needs a real-data pass before locking in.
 

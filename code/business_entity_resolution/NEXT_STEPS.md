@@ -2,7 +2,7 @@
 
 > **Target Audience**: AI Coding Assistants (Claude Code, Cursor, Copilot, etc.) & Engineers building the **Feature Engineering** and **Matching Model** stages.  
 > **Repository Context**: Amazon ML Challenge 2026 — Business Entity Resolution  
-> **Last Stage Completed**: Text Normalization (`src/normalization.py`) & Multi-Pass Compound Blocking (`src/blocking.py`)
+> **Last Stage Completed**: Full-scale normalization and multi-pass blocking. Feature engineering is next.
 
 ---
 
@@ -18,7 +18,8 @@ Raw Data (S1, S2, S3)
        ▼
 2. Blocking (Candidate Generation: multi-pass compound keys, reduction >99.999%)
        │
-       ├──► output/candidate_pairs.tsv (Official competition submission format)
+       ├──► output/candidate_pairs.tsv (Official compact candidate output)
+       ├──► cache/candidates/test_pairs/part-*.parquet (Long-form candidate ID cache)
        │
        ▼
 3. Feature Engineering (String similarity, token overlap, country match on candidate pairs)
@@ -37,10 +38,10 @@ Raw Data (S1, S2, S3)
 
 ## 2. What the Blocking Step Produced (Your Inputs)
 
-The blocking engine provides **two ways** to consume candidate pairs.
+The blocking engine provides the compact submission output and a reusable long-form candidate ID cache.
 
-### Option A (Strongly Recommended): In-Memory Batch Streaming
-At full scale, there are 1.73M Source 1 entities and $\sim 10\text{M}$ Source 2/3 entities, generating $\sim 70\text{--}100\text{M}$ candidate pairs. Materializing all text strings simultaneously in memory requires $\approx 8\text{--}12\text{ GB}$ of RAM.
+### Option A: Small In-Memory Batch Streaming
+At full scale, there are 1.73M Source 1 entities and 9.97M Source 2/3 entities, generating 224,533,181 candidate pairs. Blocking writes bounded Parquet parts containing only `source1_entity_id` and `candidate_id`; do not materialize all candidate text fields in memory.
 
 To keep memory footprint $<2\text{ GB}$ on a 16 GB machine, use the provided generator `iter_candidate_pair_batches()`:
 
@@ -53,7 +54,7 @@ from business_entity_resolution.src.blocking import (
 from business_entity_resolution.src.normalization import normalize_dataframe
 import polars as pl
 
-# 1. Load and normalize
+# 1. Load and normalize (small tests only)
 s1_df = normalize_dataframe(pl.read_csv("data/student_resource/dataset/test/test_source1.tsv", separator="\t"))
 s2_df = normalize_dataframe(pl.read_csv("data/student_resource/dataset/test/test_source2.tsv", separator="\t"))
 s3_df = normalize_dataframe(pl.read_csv("data/student_resource/dataset/test/test_source3.tsv", separator="\t"))
@@ -87,7 +88,17 @@ for batch_df in iter_candidate_pair_batches(candidate_df, s1_df, pool_df, batch_
 
 ---
 
-### Option B: Reading Directly From Disk (`candidate_pairs.tsv`)
+### Option B: Reading Candidate ID Parquet Parts
+The full-scale feature stage should scan the generated parts:
+
+```python
+candidate_pairs = pl.scan_parquet("cache/candidates/test_pairs/part-*.parquet")
+```
+
+Join each bounded batch to the normalized source caches before calculating features. The
+blocking stage intentionally does not repeat a full Source 2/3 metadata join for every batch.
+
+### Option C: Reading Directly From Disk (`candidate_pairs.tsv`)
 If you prefer running from saved disk files, the blocking step saves `output/candidate_pairs.tsv`:
 - **Format**: Tab-separated TSV (`sep="\t"`).
 - **Columns**: `source1_entity_id`, `candidate_entity_ids` (comma-separated list of candidate IDs).
@@ -124,22 +135,26 @@ pair_table = (
 
 ### 3.1 Feature Engineering
 For each candidate pair `(source1_entity_id, candidate_id)`, compute similarity features:
-1. **Name Similarity (Character Trigrams / N-Grams)**:
-   - Extract character 3-grams from `s1_name` and `cand_name`.
-   - Calculate Jaccard similarity:
-     $$J(A, B) = \frac{|A \cap B|}{|A \cup B|}$$
-   - *Why trigrams?* Script-agnostic, order-robust, handles minor typos, accents, and legal suffix variations.
+1. **Name Similarity (Character TF-IDF)**:
+   - Fit a character-level `TfidfVectorizer` once and transform names in bounded batches.
+   - Calculate sparse cosine similarity between Source 1 and candidate name vectors.
+   - Never fit a new vectorizer per candidate pair.
 2. **Address Similarity**:
-   - Calculate character trigram Jaccard similarity between `s1_address` and `cand_address`.
-   - Token set overlap (word-level Jaccard on address words).
-   - House/plot number match indicator: Binary 1 if street/door numbers match, 0 otherwise.
-3. **Combined Baseline Metric**:
-   $$\text{combined\_score} = 0.6 \times \text{name\_jaccard} + 0.4 \times \text{addr\_jaccard}$$
+   - Calculate character TF-IDF cosine similarity between normalized addresses.
+   - Preserve `address_is_missing` when the normalized address is empty.
+3. **Additional features**:
+   - `name_is_missing`
+   - `address_is_missing`
+   - `country_match`
+   - Optional name-length sanity features
+4. **Combined baseline metric**:
+   $$\text{combined\_score} = 0.6 \times \text{name\_similarity} + 0.4 \times \text{address\_similarity}$$
 
 ### 3.2 Decision Threshold / Classifier
 - Filter candidate pairs:
-  $$\text{is\_match} = \text{combined\_score} \ge \text{threshold}$$
-- **Optimal Baseline Threshold**: Our holdout benchmark on ground truth showed **$\text{threshold} = 0.40$** achieves **Macro $F_{0.5} = 0.8143$**.
+   $$\text{is\_match} = \text{combined\_score} > \text{threshold}$$
+- Tune the threshold on an internal holdout using macro $F_{0.5}$. No final threshold is
+  committed until the TF-IDF feature implementation is evaluated.
 - An entity may match **zero, one, or multiple** candidates. Keep all candidates above threshold!
 
 ---
@@ -218,13 +233,14 @@ python data/student_resource/utils/validate_submission.py \
 
 ## 7. Baseline Target to Beat
 
-The blocking stage team verified the baseline performance on a held-out split of `train_ground_truth.tsv`:
+The values below are historical trigram-Jaccard planning references only. They are not current
+TF-IDF results and must be remeasured after feature engineering is implemented.
 
 | Configuration | Macro $F_{0.5}$ | Precision | Recall |
 |---|---|---|---|
 | Raw Blocking Candidates | $\approx 0.02$ | $\approx 0.02$ | $93.5\%$ |
-| Trigram Jaccard Threshold $\ge 0.50$ | $0.7045$ | High | Moderate |
-| **Trigram Jaccard Threshold $\ge 0.40$ (Baseline)** | **$0.8143$** | **Balanced** | **Strong** |
+| Trigram Jaccard Threshold $\ge 0.50$ (historical) | $0.7045$ | High | Moderate |
+| Trigram Jaccard Threshold $\ge 0.40$ (historical) | $0.8143$ | Balanced | Strong |
 | Target for Feature Engineering / ML Model | **$> 0.8500$** | High | High |
 
 Your goal in Feature Engineering and Matching is to build on this baseline and push Macro $F_{0.5} > 0.85$!

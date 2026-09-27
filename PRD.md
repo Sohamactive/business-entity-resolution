@@ -152,7 +152,7 @@ flowchart TD
 ```
 
 ### Iteration strategy
-- **Iteration 1:** Normalize → block → 2–3 similarity features (name sim, address sim, country match) → simple threshold rule → submit. Confirms plumbing works end-to-end.
+- **Iteration 1:** Normalize → block → character TF-IDF/cosine features (name, address, country match) → simple threshold rule → submit. Confirms plumbing works end-to-end at the actual candidate scale.
 - **Iteration 2:** Use validation F_0.5 to diagnose. Low precision → tighten threshold / add features. Recall-capped → fix blocking (not the model).
 - **Iteration 3+:** Once blocking and features are trusted, replace the threshold rule with a real classifier — gradient boosting (LightGBM/XGBoost) on the similarity features. Fast to train, interpretable, trivially satisfies the ≤8B/MIT-Apache constraint, and strong on tabular similarity problems like this.
 
@@ -225,6 +225,19 @@ Records with the same key go in the same "block" — hence the name.
 ### Output
 This stage's candidate set (before final model narrowing) is saved as `candidate_pairs.tsv` — the exact input fed to the matching model in §8/§9.
 
+The full test blocking run is complete:
+
+- Source 1 entities processed: **1,732,544**
+- Source 2/3 pool indexed: **9,969,589** records
+- Long-form candidate pairs: **224,533,181**
+- Runtime: approximately **5.5 minutes** locally
+- Compact output: `output/candidate_pairs.tsv`, one row per test Source 1 entity
+- Internal cache: `cache/candidates/test_pairs/part-*.parquet`
+
+The internal Parquet parts contain only `source1_entity_id` and `candidate_id`. This avoids
+repeating a full Source 2/3 metadata join during blocking. Feature engineering retrieves the
+normalized metadata in bounded batches from the normalized source Parquet caches.
+
 ### Implementation notes
 - Use **polars** for the blocking joins (large multi-million-row joins across S1 vs S2/S3) — faster and more memory-efficient than pandas at this scale on Kaggle's available RAM.
 - Blocking runs on the **normalized** name/address fields produced in §6, not raw text.
@@ -242,16 +255,17 @@ This stage's candidate set (before final model narrowing) is saved as `candidate
 | **TF-IDF (character n-gram) + cosine similarity** | Weights n-grams by distinctiveness (common chunks down-weighted, rare/distinctive chunks up-weighted), compares as vectors via cosine angle | Medium — needs `TfidfVectorizer(analyzer='char')` + fit/transform | Fast — vectorizable | Yes | Yes (when using `analyzer='char'`, not word-based) |
 
 ### 8.2 Decision
-- **Iteration 1 (in progress):** Trigram Jaccard similarity — cheap, fast, script-agnostic, good enough to validate the end-to-end pipeline without burning setup time.
-- **Iteration 2/3 (time permitting):** Upgrade to TF-IDF character n-gram + cosine similarity — smarter weighting (down-weights generic terms like "Inc"/"Ltd" that inflate similarity without being distinctive), same script-agnostic/word-order-robust properties as trigram Jaccard, for a precision boost.
-- `difflib.SequenceMatcher` rejected outright — not vectorizable at this row count (millions of candidate pairs), and word-order sensitivity is a real problem given the transposition noise pattern called out in the problem statement.
+- **Iteration 1:** Character TF-IDF n-gram + cosine similarity. This is vectorized with sparse matrices, remains script-agnostic, and down-weights generic n-grams that can inflate similarity for common legal or address terms.
+- Use bounded candidate batches and reuse vectors for repeated source records; never compute a separate vectorization model independently for every candidate pair.
+- `difflib.SequenceMatcher` and naive Python trigram-Jaccard loops are rejected at this row count because they are not suitable for approximately 224 million candidate pairs.
 
 ### 8.3 Features computed per candidate pair
-- **Name similarity** — trigram Jaccard (Iteration 1) / TF-IDF char n-gram cosine (later) on `normalized_name`. Primary signal.
-- **Address similarity** — same method on `normalized_address`. Weaker alone (addresses noisier/more incomplete), strong combined with name.
+- **Name similarity** — character TF-IDF n-gram cosine on `normalized_name`. Primary signal.
+- **Address similarity** — character TF-IDF n-gram cosine on `normalized_address`. Weaker alone (addresses noisier/more incomplete), strong combined with name.
 - **Country match** — binary (1 if same country, 0 otherwise). Should be ~always 1 post-blocking; acts as a sanity check.
+- **Missingness flags** — `name_is_missing` and `address_is_missing`, computed when the normalized value is an empty string. Iteration 1 keeps the fixed arithmetic score but retains these flags for diagnostics and later classifiers.
 - **Length-based sanity features** (optional, cheap) — absolute difference / ratio in name length, to catch misleadingly high similarity on very short strings.
-- **Output of this stage:** candidate pairs with similarity columns attached (an intermediate, in-memory table — *not* `matching_results.tsv` yet). Feeds directly into §8.4.
+- **Output of this stage:** candidate pairs with similarity columns attached, written in bounded feature Parquet parts. This is an intermediate artifact, not `matching_results.tsv` yet, and feeds directly into §8.4.
 
 ### 8.4 Iteration 1 — threshold rule
 ```

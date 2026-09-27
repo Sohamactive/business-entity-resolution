@@ -49,9 +49,9 @@ To maximize recall while keeping blocks compact, we compute complementary keys a
    - Keys are indexed as `(country, block_key)`. Cross-country matching is prevented at the index level without hardcoding country strings.
 
 ### 3.2 Candidate Pairs Generated & Statistics
-- **Total candidate pool per entity**: Median = 144, Mean = 107.1, 95th Percentile = 150, Max = 150 (enforced via configurable `.env` cap `BLOCKING_MAX_CANDIDATES=150`).
-- **Reduction Ratio**: >99.999% reduction in pairwise comparison space (from $1.7 \times 10^{13}$ to $<1.8 \times 10^8$ total pairs).
-- **Execution Throughput**: >20,000 entities/sec using prioritized inverted indexing.
+- **Total candidate pool per entity**: Full test output contains 224,533,181 pairs across 1,732,544 entities (mean approximately 129.6; cap 150 enforced via configurable `.env` setting `BLOCKING_MAX_CANDIDATES=150`).
+- **Reduction Ratio**: Approximately 99.9987% reduction in pairwise comparison space (from about $1.7 \times 10^{13}$ to 224,533,181 candidate pairs).
+- **Execution Throughput**: 16,035 Source 1 entities/sec during candidate generation; full run completed in approximately 5.5 minutes locally.
 
 ### 3.3 How True Matches Were Preserved (Recall Guarantee)
 - **Union Architecture**: Name and address noise fail independently. Candidates from Pass A (DBA-aware name keys) and Pass B (compound address keys) are unioned across priority tiers.
@@ -67,11 +67,11 @@ To maximize recall while keeping blocks compact, we compute complementary keys a
 ## 4. Matching Model
 
 **Features used:**
-- Name features: Character trigram Jaccard similarity, TF-IDF char n-gram cosine similarity, length difference ratios.
-- Address features: Character trigram Jaccard similarity, token set overlap, digit set match indicator.
-- Other: Binary country match, candidate multi-key agreement count.
+- Name features: Character TF-IDF n-gram cosine similarity, missingness flag, and optional length-difference ratios.
+- Address features: Character TF-IDF n-gram cosine similarity and missingness flag.
+- Other: Binary country match; candidate multi-key agreement is retained as a possible later feature.
 
-**Model type:** [LightGBM / Threshold Rule Baseline]  
+**Model type:** Iteration 1 threshold rule over sparse TF-IDF cosine features
 **Threshold selection method:** Macro-$F_{0.5}$ grid search on internal holdout split.
 
 ---

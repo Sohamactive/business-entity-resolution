@@ -5,6 +5,6 @@ data/
 
 __pycache__/*
 *.pyc
-
-.vscode
 cache/
+cache.zip
+.vscode
