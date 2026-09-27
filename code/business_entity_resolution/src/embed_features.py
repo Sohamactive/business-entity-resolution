@@ -62,7 +62,6 @@ def embedding_similarity(
     index: dict[str, int], matrix: np.ndarray,
 ) -> np.ndarray:
     """Cosine similarity by index lookup; unknown/empty names score 0.0."""
-    n_rows = matrix.shape[1]
     sims = np.zeros(len(s1_names), dtype=np.float32)
     ok_s1 = np.array([index.get(t, -1) for t in s1_names])
     ok_c = np.array([index.get(t, -1) for t in cand_names])
@@ -70,3 +69,53 @@ def embedding_similarity(
     if both.any():
         sims[both] = (matrix[ok_s1[both]] * matrix[ok_c[both]]).sum(axis=1)
     return np.round(sims, 4)
+
+
+EMB_FEATURE_COLS = [
+    "emb_name_similarity",
+    "name_is_missing",
+    "address_is_missing",
+    "country_match",
+    "name_len_diff",
+    "name_len_ratio",
+    "addr_len_diff",
+]
+
+
+def cheap_pair_features(
+    joined: pl.DataFrame,
+    index: dict[str, int],
+    matrix: np.ndarray,
+) -> pl.DataFrame:
+    """Fast GPU-free features for one joined batch (no TF-IDF).
+
+    Expects: source1_entity_id, candidate_id, s1_norm_name,
+    s1_norm_address, s1_country, cand_norm_name, cand_norm_address,
+    cand_country. Returns those IDs plus EMB_FEATURE_COLS.
+    """
+    s1_names = joined["s1_norm_name"].fill_null("").to_list()
+    cand_names = joined["cand_norm_name"].fill_null("").to_list()
+    s1_addr = joined["s1_norm_address"].fill_null("").to_list()
+    cand_addr = joined["cand_norm_address"].fill_null("").to_list()
+    s1_c = joined["s1_country"].fill_null("").to_list()
+    cand_c = joined["cand_country"].fill_null("").to_list()
+
+    emb = embedding_similarity(s1_names, cand_names, index, matrix)
+    s1_len = np.array([len(t) for t in s1_names], dtype=np.float32)
+    c_len = np.array([len(t) for t in cand_names], dtype=np.float32)
+    s1_alen = np.array([len(t) for t in s1_addr], dtype=np.float32)
+    c_alen = np.array([len(t) for t in cand_addr], dtype=np.float32)
+
+    return pl.DataFrame(
+        {
+            "source1_entity_id": joined["source1_entity_id"].to_list(),
+            "candidate_id": joined["candidate_id"].to_list(),
+            "emb_name_similarity": emb.tolist(),
+            "name_is_missing": [1 if not t else 0 for t in s1_names],
+            "address_is_missing": [1 if not (a and b) else 0 for a, b in zip(s1_addr, cand_addr)],
+            "country_match": [1 if a == b else 0 for a, b in zip(s1_c, cand_c)],
+            "name_len_diff": np.abs(s1_len - c_len).tolist(),
+            "name_len_ratio": (np.minimum(s1_len, c_len) / np.maximum(np.maximum(s1_len, c_len), 1)).tolist(),
+            "addr_len_diff": np.abs(s1_alen - c_alen).tolist(),
+        }
+    )
