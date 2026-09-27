@@ -36,7 +36,11 @@ def build_name_vectors(
     """Encode unique names on GPU with normalized outputs. Saves nothing."""
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(model_name, device="cuda")
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Encoding {len(names)} names on {device}...")
+    model = SentenceTransformer(model_name, device=device)
     matrix = model.encode(
         names, batch_size=batch_size, show_progress_bar=True,
         convert_to_numpy=True, normalize_embeddings=True,

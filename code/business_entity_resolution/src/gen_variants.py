@@ -39,16 +39,24 @@ def main() -> None:
            .select("entity_id", "country").collect())
     cmap = dict(zip(s1c["entity_id"].to_list(), s1c["country"].to_list()))
     all_ids = s1c["entity_id"].to_list()
+    # Unseen countries (present in test, absent from train) get the stricter
+    # cutoff. Derived from data, never a hardcoded country name, so new
+    # unseen values fall back to the strict side automatically.
+    train_s1 = args.normalized_dir / "train_source1.parquet"
+    seen = (set(pl.scan_parquet(train_s1).select("country").collect()["country"].to_list())
+            if train_s1.exists() else set())
+    unseen = {c for c in set(cmap.values()) if c not in seen}
+    print(f"Seen countries: {sorted(seen)} | strict-cutoff countries: {sorted(unseen)}")
     fr = probas.with_columns(
         pl.col("source1_entity_id").map_elements(cmap.get, return_dtype=pl.String).alias("country"))
 
     for spec in args.variants:
         g, _, f = spec.partition(":")
         gthr, fthr = float(g), float(f) if f else float(g)
-        name = f"thr{gthr}_fr{fthr}".replace(".", "p")
+        name = f"thr{gthr}_unseen{fthr}".replace(".", "p")
         accepted = fr.filter(
-            ((pl.col("country") == "France") & (pl.col("proba") > fthr))
-            | ((pl.col("country") != "France") & (pl.col("proba") > gthr))
+            ((pl.col("country").is_in(sorted(unseen))) & (pl.col("proba") > fthr))
+            | ((~pl.col("country").is_in(sorted(unseen))) & (pl.col("proba") > gthr))
         ).select("source1_entity_id", "candidate_id")
         matching_df = group_matches(accepted, all_ids)
         out = args.out_dir / f"matching_results_{name}.tsv"

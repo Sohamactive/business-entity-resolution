@@ -8,3 +8,7 @@ __pycache__/*
 cache/
 cache.zip
 .vscode
+
+output/matching_results.tsv
+output/candidate_pairs.tsv
+
